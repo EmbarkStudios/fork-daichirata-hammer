@@ -27,15 +27,15 @@ func Diff(ddl1, ddl2 DDL) (DDL, error) {
 func NewDatabase(ddl DDL) (*Database, error) {
 	var tables []*Table
 
-	m := make(map[string]*Table)
+	m := make(map[spansql.ID]*Table)
 	for _, istmt := range ddl.List {
 		switch stmt := istmt.(type) {
 		case *spansql.CreateTable:
 			t := &Table{CreateTable: stmt}
 			tables = append(tables, t)
-			m[string(stmt.Name)] = t
+			m[stmt.Name] = t
 		case *spansql.CreateIndex:
-			if t, ok := m[string(stmt.Table)]; ok {
+			if t, ok := m[stmt.Table]; ok {
 				t.indexes = append(t.indexes, stmt)
 			} else {
 				return nil, fmt.Errorf("cannot find ddl of table to apply index %s", stmt.Name)
@@ -57,7 +57,7 @@ func NewDatabase(ddl DDL) (*Database, error) {
 	}
 	for _, t := range tables {
 		if i := t.Interleave; i != nil {
-			if p, ok := m[string(i.Parent)]; ok {
+			if p, ok := m[i.Parent]; ok {
 				p.children = append(p.children, t)
 			} else {
 				return nil, fmt.Errorf("parent ddl %s not found", i.Parent)
@@ -152,7 +152,12 @@ func (g *Generator) generateDDLForDropConstraintIndexAndTable(table *Table) DDL 
 		ddl.Append(spansql.DropIndex{Name: i.Name})
 	}
 	ddl.AppendDDL(g.generateDDLForDropNamedConstraintsMatchingPredicate(func(constraint spansql.TableConstraint) bool {
-		return constraint.ForeignKey.RefTable == table.Name
+		fk, ok := constraint.Constraint.(spansql.ForeignKey)
+		if !ok {
+			return false
+		}
+
+		return fk.RefTable == table.Name
 	}))
 	ddl.Append(spansql.DropTable{Name: table.Name})
 	g.dropedTable = append(g.dropedTable, table.Name)
@@ -253,17 +258,22 @@ func (g *Generator) generateDDLForColumns(from, to *Table) DDL {
 	return ddl
 }
 
-func (g *Generator) generateDDLForDropColumn(table string, column string) DDL {
+func (g *Generator) generateDDLForDropColumn(table spansql.ID, column spansql.ID) DDL {
 	ddl := DDL{}
 
 	ddl.AppendDDL(g.generateDDLForDropNamedConstraintsMatchingPredicate(func(constraint spansql.TableConstraint) bool {
-		for _, c := range constraint.ForeignKey.Columns {
+		fk, ok := constraint.Constraint.(spansql.ForeignKey)
+		if !ok {
+			return false
+		}
+
+		for _, c := range fk.Columns {
 			if column == c {
 				return true
 			}
 		}
 
-		for _, refColumn := range constraint.ForeignKey.RefColumns {
+		for _, refColumn := range fk.RefColumns {
 			if column == refColumn {
 				return true
 			}
@@ -341,7 +351,7 @@ func (g *Generator) generateDDLForCreateIndex(from, to *Table) DDL {
 	return ddl
 }
 
-func (g *Generator) generateDDLForDropNamedConstraint(table string, constraint spansql.TableConstraint) DDL {
+func (g *Generator) generateDDLForDropNamedConstraint(table spansql.ID, constraint spansql.TableConstraint) DDL {
 	ddl := DDL{}
 
 	if constraint.Name == "" {
@@ -428,8 +438,16 @@ func (g *Generator) columnTypeEqual(x, y spansql.ColumnDef) bool {
 func (g *Generator) constraintEqual(x, y spansql.TableConstraint) bool {
 	x.Position = spansql.Position{}
 	y.Position = spansql.Position{}
-	x.ForeignKey.Position = spansql.Position{}
-	y.ForeignKey.Position = spansql.Position{}
+
+	if fk, ok := x.Constraint.(spansql.ForeignKey); ok {
+		fk.Position = spansql.Position{}
+		x.Constraint = fk
+	}
+
+	if fk, ok := y.Constraint.(spansql.ForeignKey); ok {
+		fk.Position = spansql.Position{}
+		y.Constraint = fk
+	}
 
 	return reflect.DeepEqual(x, y)
 }
@@ -468,7 +486,7 @@ func (g *Generator) findColumnByName(cols []spansql.ColumnDef, name spansql.ID) 
 	return
 }
 
-func (g *Generator) findNamedConstraint(constraints []spansql.TableConstraint, name string) (con spansql.TableConstraint, exists bool) {
+func (g *Generator) findNamedConstraint(constraints []spansql.TableConstraint, name spansql.ID) (con spansql.TableConstraint, exists bool) {
 	if name == "" {
 		exists = false
 		return
